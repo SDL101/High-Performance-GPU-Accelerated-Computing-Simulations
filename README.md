@@ -79,6 +79,25 @@ The system uses a sophisticated parameter sweep mechanism that:
    ```
    Automatically submits all generated configurations to the HPC cluster.
 
+## 🔍 Simulation Workflow Details
+
+The current repository workflow consists of the following steps:
+
+1. **Base Template (`Base_Starters_Input.txt`):**
+   Defines all simulation settings and placeholder parameters (e.g., Angle, Pump_Scale).
+2. **Parameter Generation (`Change_Inputs.sh`):**
+   Reads the base template and creates `.txt` MuMax3 input files for each combination of parameters.
+3. **Named Configurations (`Angle=...txt` Files):**
+   Input files whose filenames encode their specific parameter values (e.g., `Angle=7deg_StrainEo=0ppm_Phase=0deg_B1=0x_alpha=0x.txt`).
+4. **Job Script Creation (`Change_Inputs_Job.sh`):**
+   Generates SLURM job scripts (`RunMe_*.sh`) by copying `Job_Template.sh` and injecting the correct input filenames and paths.
+5. **SLURM Submission Template (`Job_Template.sh`):**
+   Specifies GPU resources, runtime, and module loads (MuMax3, CUDA) for each job.
+6. **Batch Submission (`submit-all.sh`):**
+   Submits all `RunMe_*.sh` scripts to the HPC cluster using `sbatch` and displays current job queue status.
+
+Once submitted, each job runs MuMax3 on its `.txt` input script, producing `.ovf` output files and time-step data for analysis.
+
 ## 📊 Output Management
 
 The system automatically:
