@@ -1,0 +1,534 @@
+// DESCRIPTION
+// This script simulates spin waves and parametric pumping in a magnetic material.
+// I can't figure out how to write/call functions for MuMax, so it all reads in sequence. 
+// Lots of inputs are at the top, but each section does have other inputs within. 
+// For example, to change the transducer length, the input lies in the section TRANSDUCER AND PUMP GEOMETRY. To smooth the edges of the pumping wave, the input is in WRITE EXCITATION AND PUMP. To change the damping at the edges, the input is in DAMPING AND INITIALIZATIONS
+// The outputs are saved as .ovf files, which can be converted to .png or .csv using the mumax-convert command in the terminal (or batch script). They show every location at one time.
+// Also a table of selected values is stored at every timestep. Its columns are detailed in the section PICK DATA TO SAVE
+
+
+// 1. INPUTS
+// 2. DAMPING AND INITIALIZATIONS
+// 3. TRANSDUCER AND PUMP GEOMETRY
+// 4. WRITE EXCITATION AND PUMP
+// 5. PICK DATA TO SAVE
+// 6. RUN SIMULATION
+
+//____________________________
+//
+// 1. INPUTS
+//____________________________
+ // =MAX(A1:BZT2048)
+	SizeMult := 1/4
+	Angle:=45
+	Alpha_Scale:=0
+	B1_Scale:=0
+	Pump_Scale:=0
+
+	 // MAGNETIC PROPERTIES
+	enabledemag = true      // demag ,necessary for BV and surface waves
+	Aex         = 2e-12     // Exchange stiffness, J/m
+	YIG_Alpha   := 1e-4
+	alpha       = Alpha_Scale*YIG_Alpha // LLG Damping, unitless, YIG= 1e-5 at 1um - 1e-4 at 1nm
+	Msat        = 140e3     // Saturation magnetization, YIG=140e3
+	B1 			= B1_Scale * 0.35e6	// First  order magnetoelastic coupling constant, J/m3
+	B2 			= 0.7e6		// Second order magnetoelastic coupling constant, J/m3
+	Temp 		= 293*0		// Temperature, Kelvin
+	Kc1 		= -610      // J/m3
+	Kc2 		= -26       // J/m37
+	AnisC1 		= vector(-1,-1,1)  // 1,1,1 cut
+	AnisC2 		= vector(-0.21132487, 0.78867513, 0.57735027) // 1,1,1 cut
+	//AnisC1 		= vector(0,0,1) // 0,0,1 cut
+	//AnisC2 		= vector(1,0,0) // 0,0,1 cut
+	
+	 // EXCITATION AND BIAS
+	Bias_Direction      := vector(0,0,1) // Direction of bias field
+	Bias_Strength:=199.822e-3 //199.7850e-3  //207.5e-3 -5.84e-3 -0.3e-3       // Static bias field, T. For 1.8um/2GHz, 207 works with demag=1 out of plane. Anisotryopy contributes +5.8 mT out of plane
+	Pump_Direction      := Bias_Direction //Stimulus Direction for pump
+	Stimulus_Direction  := vector(1,0,0) // Direction for transducer stimulus (magnetic)
+	
+	// EXCITATION AMPLITUDE / FREQUENCIES / WAVENUMBERS
+	Signal_Freq         := 2e9              // Applied to antenna / transducer, Hz
+	Signal_k 	    	:= 2*pi/(1.8024e-6*cos(Angle*pi/180))  // wavenumber, rad/m. For 2GHz/4GHz on Z-Cut YIG at zero degree incidence, spinwave = 1.793 um, acoustic = 0.896 um. At 20deg, spinwave = 1.684 um, acoustic = 0.896 um
+	Wave_Vel_Theoretical:= 436 				// m/s calculated group velocity, for coordinating arrival time of wave into pump region.
+	Signal_Strength     := (Bias_Strength-Msat.getregion(0)*4e-7*pi)*0.001/5  // Magnetic excitation field, T. I like to do 1 percent of bias field
+	//Excitation_Amplitude:= Signal_Strength  // amplitude of excitation field -- This is better to assign later, near the WRITE EXCITATION AND PUMP where it can be normalized to pump geometry, but moved here for clarity
+	Pump_Amplitude:=Pump_Scale*1e-6  			// amplitude of pumping strain, xx comonent
+	Pump_Freq 			:= Signal_Freq*2    // frequency of pumping wave, Hz
+	
+	
+	// STRAIN RELATIONSHIPS
+	dEzz_dExx 		    := 2.2803/5.4269 // proportionality between strain components, from literature, 111-Cut YIG
+	dExy_dExx 		    := 0.3872/5.4269 // proportionality between strain components, from literature, 111-Cut YIG
+	dExz_dExx 		    := 0.0095/5.4269 // proportionality between strain components, from literature, 111-Cut YIG
+	dEyz_dExx 		    := 0.0663/5.4269 // proportionality between strain components, from literature, 111-Cut YIG
+
+
+	// TIMING
+	Time_Step  := 1/(Signal_Freq*2*2 *16)// Sampling time
+	Run_Time   := 300e-9  				 // Total time	 
+	maxDt       = Time_Step 			 // Constrain timestep
+	
+	// SIZING
+	dx := 1.684e-6/2 /32    // cell size x. 32x Nyquist is OK
+	dy := 1.684e-6/2 /32    // cell size y. 32x Nyquist is OK
+	dz := 1e-6     			// cell size z
+	nx := 1024 *8*SizeMult 			// number of cells x
+	ny := 1024 *8*SizeMult  			// number of cells y
+	nz := 1        			// number of cells z
+	setPBC(6/SizeMult,6/SizeMult,0) 			// periodic boundary conditions, + number of repetitions seen by demag kernel.
+
+//________________________________________________________
+//
+// 			2. DAMPING AND INITIALIZATIONS
+//________________________________________________________
+	
+	// Establish grid
+	setgridsize(nx, ny, nz)
+	setcellsize(dx, dy, dz)
+	YIG_Region := 0 // Region 0 is standard YIG
+	
+	// INCREASE DAMPING AT EDGES
+	Damping_Step_Mult 	:= 1.33 // damping alpha will step in multiples of this
+	Damping_Max 		:= 1. + 0*YIG_Alpha // alpha value at edges of box
+	Num_DampingNodes_X 	:= nx/8 // Damping nodes per side (total nodes = x*2)
+	Num_DampingNodes_Y 	:= ny/8  // Damping nodes per side (total nodes = x*2)
+	Endzone_Mult_X 		:= 1   // Enhance the size of the last damping zone relative to the others.
+	YIG_Length_X := (nx-2*Num_DampingNodes_X)*dx // Size of YIG, within high-dampling borders
+	YIG_Length_Y := (ny-2*Num_DampingNodes_Y)*dy // Size of YIG, within high-dampling borders
+
+	//ADD DAMPING AROUND EDGES
+	Region_Start 		:= 1.
+	Damping_Strength	:= YIG_Alpha
+	Damping_Temp 		:= Damping_Strength
+	Num_Steps_Needed 	:= 0
+	Reg 				:= 0 
+	// Find how many steps you need (could have been done with a logarithm but booooo mumax) 
+	for Regio:= Region_Start ; Damping_Temp < Damping_Max ; Regio =Regio+1{
+			Num_Steps_Needed += 1
+			Damping_Temp = Damping_Temp * Damping_Step_Mult
+			Reg += 1
+		}
+	// Make buffer region and assign damping for successive regions
+	for Regio:= Region_Start ; Damping_Strength < Damping_Max ; Regio ++{
+		Damping_Strength  	= Damping_Strength*Damping_Step_Mult
+		Damp_Buffer_Cells_X := Num_DampingNodes_X - floor(Num_DampingNodes_X*(Regio-Region_Start)/(Num_Steps_Needed + Endzone_Mult_X-1)) // start with inverse of small rectangle, assign lowest damping, move outward
+		Damp_Buffer_Cells_Y := Num_DampingNodes_Y - floor(Num_DampingNodes_Y*(Regio-Region_Start)/Num_Steps_Needed)
+		Damp_Buffer_SizeX 	:= (nx-Damp_Buffer_Cells_X*2)*dx
+		Damp_Buffer_SizeY 	:= (ny-Damp_Buffer_Cells_Y*2)*dy
+		Damp_Buffer       	:= rect(Damp_Buffer_SizeX ,  Damp_Buffer_SizeY).inverse()
+		Damp_Region 	  	:= floor(Regio)
+		defregion(Damp_Region, Damp_Buffer)
+		alpha.setregion(Damp_Region, Damping_Strength)
+	}
+	alpha.setRegion(YIG_Region, YIG_Alpha)
+	
+	
+	//INITIALIZATIONS
+	
+	// Bias and set initial m
+	Bias_Direction = Bias_Direction.Div(Bias_Direction.Len())  // normalize
+	Bias_Field := Bias_Direction.Mul(Bias_Strength) 
+	B_ext = Bias_Field // Uniform Bias Field
+	m = uniform(Bias_Direction.X(), Bias_Direction.Y(), Bias_Direction.Z()) 
+	
+	// Initialze variables to be used later
+	Excitation :=0.
+	InputPlane_Distance := 0.
+	SignalPlane_Distance := 0.
+	r := vector(0,0,0)
+	x := 0.
+	y := 0.
+	Initial := 0.
+	Last_Time := 0.
+	TA 	:= now()
+	TB  := now()
+	Excitation_StandingWave_I := newVectorMask(Nx, Ny, 1)
+	Excitation_StandingWave_Q := newVectorMask(Nx, Ny, 1)
+	//Excitation_StandingWave_I2 := newVectorMask(Nx, Ny, 1)
+	//Excitation_StandingWave_Q2 := newVectorMask(Nx, Ny, 1)	
+	//Excitation_ScalarField_I:= newScalarMask(Nx, Ny, 1)
+	//Excitation_ScalarField_Q:= newScalarMask(Nx, Ny, 1)
+	//Pump_StandingWave_I := newVectorMask(Nx, Ny, 1)
+	//Pump_StandingWave_Q := newVectorMask(Nx, Ny, 1)
+	Pump_ScalarField_I:= newScalarMask(Nx, Ny, 1)
+	Pump_ScalarField_Q:= newScalarMask(Nx, Ny, 1)
+	Blank_Ones_Mask := ConstVector(0,0,1)
+	
+
+
+//________________________________________________________
+//
+// 			3. TRANSDUCER AND PUMP PLACEMENT
+//________________________________________________________
+	
+
+	// PUMP GEOMETRY -- INPUTS HERE
+	Reg += 1  
+	Pump_Region   := Reg // keep track of which region is the pump
+	Pump_Rotation := 0 * pi/180
+	Pump_Width    := YIG_Length_X *  1// 1/4*4     + 0*nx*dx   // X Dimension
+	Pump_Length   := YIG_Length_Y * 1// 1/4     + 0*ny*dy + 0*1.5*20e-6*SizeMult  // Y Dimension
+	//print(Pump_Width)
+	//print(Pump_Length)
+	Pump_Offset_X := YIG_Length_X * -1/2*1/3*0 			   // Move Pump in X Direction
+	Pump_Offset_Y := YIG_Length_Y * 0                      // Move Pump in Y Direction
+	Pump          := rect(Pump_Width , Pump_Length).rotz(Pump_Rotation).transl(Pump_Offset_X, Pump_Offset_Y,0) // rectangular pump
+	//Pump          := circle(min(Pump_Width,Pump_Length)).rotz(Pump_Rotation).transl(Pump_Offset_X, Pump_Offset_Y,0) // circular pump (takes the smaller of X,Y dimensions)
+	defregion(Pump_Region, Pump)
+
+	Pump_Width2 := YIG_Length_X *  1/4*4
+	Pump_Length2 := YIG_Length_Y * 1/4
+	// TRANSDUCER GEOMETRY -- INPUTS HERE
+	Reg += 1
+	Transducer_Region   := Reg  // keep track of which region is the transducer
+	Transducer_Rotation:=-Angle * pi/180 // rotate the transducer
+	Transducer_Width    := (YIG_Length_X *1/8*0   + 2*pi/Signal_k*8.75*SizeMult + 0*dx)*0 + Pump_Length2/1.5                     // X Dimension
+	Transducer_Length   := (YIG_Length_Y *1/4*0 + 0*dy + Transducer_Width*1.5)*0 + Pump_Length2				                      // Y Dimension
+	PumpTrans_Distance  := (Pump_Offset_X - YIG_Length_X*-1/2 - Transducer_Width/2)*1 + 0*70e-6*SizeMult             // Distance from center of pump to center of transducer. Try to place transducer against left edge of YIG. 
+	//Transducer_Offset_X := YIG_Length_X * (-1/2) + Transducer_Width/2*abs(cos(Transducer_Rotation)) + Transducer_Length/2*abs(sin(Transducer_Rotation)) // Move Transducer in X Direction
+	Transducer_Offset_X := Pump_Offset_X - PumpTrans_Distance*(abs(cos(Transducer_Rotation))) // Move Transducer in X Direction
+	Transducer_Offset_Y := Pump_Offset_Y - PumpTrans_Distance*((sin(Transducer_Rotation)))    // Move Transducer in Y Direction   //   + Transducer_Length/2*abs(cos(Transducer_Rotation)) + Transducer_Width/2*abs(sin(Transducer_Rotation))
+	Transducer          := rect(Transducer_Width , Transducer_Length).rotz(Transducer_Rotation).transl(Transducer_Offset_X, Transducer_Offset_Y,0) // define transducer shape
+	defregion(Transducer_Region, Transducer)
+	
+	
+	// SIGNAL / IDLER EXPECTED LOCATIONS
+	// Define signal output region, opposite from input transducer
+	Reg += 1
+	Signal_Input_Region := Reg
+	Signal_Input := rect(Transducer_Width*0 + dx*4 , Transducer_Length*0.2+dx*1).rotz(Transducer_Rotation).transl(Transducer_Offset_X + Transducer_Width/2*cos(Transducer_Rotation), Transducer_Offset_Y + Transducer_Width/2*sin(Transducer_Rotation),0)
+	defregion(Signal_Input_Region, Signal_Input)
+	// Define region a couple wavelengths beyond input transducer	
+	Reg += 1
+	Signal_Away_Region1 := Reg
+	Signal_Away1 := rect(Transducer_Width*0 + dx*4 , Transducer_Length*0.2+dx*1).rotz(Transducer_Rotation).transl(Transducer_Offset_X*1 + Transducer_Width/2*cos(Transducer_Rotation)*2.2, Transducer_Offset_Y*1 + Transducer_Width/2*sin(Transducer_Rotation)*2.2,0)
+	defregion(Signal_Away_Region1, Signal_Away1)	
+	// Define signal output region, opposite from input transducer
+	Reg += 1
+	Signal_Output_Region := Reg
+	Signal_Output := rect(Transducer_Width*0 + dx*4 , Transducer_Length*0.2+dx*1).rotz(Transducer_Rotation).transl(-Transducer_Offset_X, -Transducer_Offset_Y,0)
+	defregion(Signal_Output_Region, Signal_Output)
+	// Define idler output region, opposite from input transducer, mirrored across middle horizon.
+	Reg += 1
+	Idler_Output_Region := Reg
+	Idler_Output := rect(Transducer_Width*0 + dx*4 , Transducer_Length*1+dx*1).rotz(-Transducer_Rotation).transl(-Transducer_Offset_X, Transducer_Offset_Y,0)
+	defregion(Idler_Output_Region, Idler_Output)
+
+	// Adding more output regions
+	Reg += 1
+	Signal_Away_Region2 := Reg
+	Signal_Away2 := rect(Transducer_Width*0 + dx*4 , Transducer_Length*0.2+dx*1).rotz(Transducer_Rotation).transl(Transducer_Offset_X*0.80 + Transducer_Width/2*cos(Transducer_Rotation)*2.2, Transducer_Offset_Y*0.80 + Transducer_Width/2*sin(Transducer_Rotation)*2.2,0)
+	defregion(Signal_Away_Region2, Signal_Away2)	
+
+	Reg += 1
+	Signal_Away_Region3 := Reg
+	Signal_Away3 := rect(Transducer_Width*0 + dx*4 , Transducer_Length*0.2+dx*1).rotz(Transducer_Rotation).transl(Transducer_Offset_X*0.60 + Transducer_Width/2*cos(Transducer_Rotation)*2.2, Transducer_Offset_Y*0.60 + Transducer_Width/2*sin(Transducer_Rotation)*2.2,0)
+	defregion(Signal_Away_Region3, Signal_Away3)
+
+	Reg += 1
+	Signal_Away_Region4 := Reg
+	Signal_Away4 := rect(Transducer_Width*0 + dx*4 , Transducer_Length*0.2+dx*1).rotz(Transducer_Rotation).transl(Transducer_Offset_X*0.40 + Transducer_Width/2*cos(Transducer_Rotation)*2.2, Transducer_Offset_Y*0.40 + Transducer_Width/2*sin(Transducer_Rotation)*2.2,0)
+	defregion(Signal_Away_Region4, Signal_Away4)
+
+	Reg += 1
+	Signal_Away_Region5 := Reg
+	Signal_Away5 := rect(Transducer_Width*0 + dx*4 , Transducer_Length*0.2+dx*1).rotz(Transducer_Rotation).transl(Transducer_Offset_X*0.20 + Transducer_Width/2*cos(Transducer_Rotation)*2.2, Transducer_Offset_Y*0.20 + Transducer_Width/2*sin(Transducer_Rotation)*2.2,0)
+	defregion(Signal_Away_Region5, Signal_Away5)
+
+	Reg += 1
+	Signal_Away_Region6 := Reg
+	Signal_Away6 := rect(Transducer_Width*0 + dx*4 , Transducer_Length*0.2+dx*1).rotz(Transducer_Rotation).transl(Transducer_Offset_X*0.0 + Transducer_Width/2*cos(Transducer_Rotation)*2.2, Transducer_Offset_Y*0.0 + Transducer_Width/2*sin(Transducer_Rotation)*2.2,0)
+	defregion(Signal_Away_Region6, Signal_Away6)
+
+	Reg += 1
+	Signal_Away_Region7 := Reg
+	Signal_Away7 := rect(Transducer_Width*0 + dx*4 , Transducer_Length*0.2+dx*1).rotz(Transducer_Rotation).transl(-Transducer_Offset_X*0.20 + Transducer_Width/2*cos(Transducer_Rotation)*2.2, -Transducer_Offset_Y*0.20 + Transducer_Width/2*sin(Transducer_Rotation)*2.2,0)
+	defregion(Signal_Away_Region7, Signal_Away7)
+
+	Reg += 1
+	Signal_Away_Region8 := Reg
+	Signal_Away8 := rect(Transducer_Width*0 + dx*4 , Transducer_Length*0.2+dx*1).rotz(Transducer_Rotation).transl(-Transducer_Offset_X*0.40 + Transducer_Width/2*cos(Transducer_Rotation)*2.2, -Transducer_Offset_Y*0.40 + Transducer_Width/2*sin(Transducer_Rotation)*2.2,0)
+	defregion(Signal_Away_Region8, Signal_Away8)	
+
+
+	// DEFINE NODE BOUNDARIES OF EXCITATIONS -- FOR LATER USE IN SAVING DATA
+	Left_Transducer  := max(0,   floor(nx/2 + (Transducer_Offset_X - Transducer_Width/2*abs(cos(Transducer_Rotation)) - Transducer_Length/2*abs(sin(Transducer_Rotation)) )/dx))
+	Right_Transducer := min(nx-1, ceil(nx/2 + (Transducer_Offset_X + Transducer_Width/2*abs(cos(Transducer_Rotation)) + Transducer_Length/2*abs(sin(Transducer_Rotation)) )/dx))
+	Top_Transducer   := min(ny-1, ceil(ny/2 + (Transducer_Offset_Y + Transducer_Length/2*abs(cos(Transducer_Rotation)) + Transducer_Width/2*abs(sin(Transducer_Rotation)) )/dy))
+	Bottom_Transducer:= max(0,   floor(ny/2 + (Transducer_Offset_Y - Transducer_Length/2*abs(cos(Transducer_Rotation)) - Transducer_Width/2*abs(sin(Transducer_Rotation)) )/dy))
+	MidLR_Transducer := floor((Left_Transducer + Right_Transducer)/2)
+	MidUD_Transducer := floor((Bottom_Transducer + Top_Transducer)/2)
+	RightEdgeLR_Transducer := floor(MidLR_Transducer + (Transducer_Width/2*(cos(Transducer_Rotation)))/dx)
+	RightEdgeUD_Transducer := floor(MidUD_Transducer + (Transducer_Width/2*sin(Transducer_Rotation))/dy)
+	
+	Left_Pump  := max(0,   floor(nx/2 + (Pump_Offset_X - Pump_Width/2*abs(cos(Pump_Rotation)) - Pump_Length/2*abs(sin(Pump_Rotation)) )/dx))
+	Right_Pump := min(nx-1, ceil(nx/2 + (Pump_Offset_X + Pump_Width/2*abs(cos(Pump_Rotation)) + Pump_Length/2*abs(sin(Pump_Rotation)) )/dx))
+	Top_Pump   := min(ny-1, ceil(ny/2 + (Pump_Offset_Y + Pump_Length/2*abs(cos(Pump_Rotation)) + Pump_Width/2*abs(sin(Pump_Rotation)) )/dy))
+	Bottom_Pump:= max(0,   floor(ny/2 + (Pump_Offset_Y - Pump_Length/2*abs(cos(Pump_Rotation)) - Pump_Width/2*abs(sin(Pump_Rotation)) )/dy))
+	MidLR_Pump := floor((Left_Pump + Right_Pump)/2)
+	MidUD_Pump := floor((Bottom_Pump + Top_Pump)/2)
+	
+	SignalOut_X := min(nx-1,RightEdgeLR_Transducer + 2*(MidLR_Pump - RightEdgeLR_Transducer))
+	SignalOut_Y := max(0,RightEdgeUD_Transducer + 2*(MidUD_Pump - RightEdgeUD_Transducer))
+	IdlerOut_Y  := RightEdgeUD_Transducer
+	
+	Top := ny-1
+	Bottom := 0
+	
+//________________________________________________________
+//
+// 			4. WRITE EXCITATION AND PUMP
+//________________________________________________________	
+	// DESCRIPTION!
+	// These excitations are written first as vector/scalar fields, and then added to the external field B_ext, or the strain components Exx, Eyy, etc.
+	// The static vector/scalar fields are written at every node once, rather than at every node at every time step.
+	// To accomplish the time modulation, MuMax is difficult about the inputs it can take. The excitation is split into I and Q components, and each one is varied sinusoidally, with a phase differential.
+	// It's like how a standing wave can be split into two travelling waves, or in this case, a travelling wave is split into two standing waves.
+	// The excitation varies according to a Gaussian function, both in space and in time. 
+	// In time, the gaussian function rises, then holds at its maximum for a while, then falls.
+	// In space, the gaussian varies along (parallel to) the direction of the wave travel and also across (perpendicular to) the direction of wave travel.
+	
+	//_________________
+	//
+	// WRITE EXCITATION
+	//__________________
+	
+	// EXCITATION AMPLITUDE / FREQUENCIES / WAVENUMBERS -- INPUTS HERE
+	Excitation_Amplitude := Signal_Strength / (Transducer_Width*Signal_k) / 0.6 /0.5 / 1.8// Amplitude of excitation field, normalized to transducer size.
+		
+	Exc_Duration := 1e-3*1 + 0*Run_Time*0.90  // Duration of full-strength excitation
+	Exc_Gaussian_RiseTime := 5e-9 / 10000 	  // Rise time of Gaussian, beginning/end of excitation
+	Exc_Delay := Exc_Gaussian_Risetime*2      // Shift Temporal Gaussian
+	
+	// Gaussian profiles in direction of wave travel  Oops! Bad variable names!
+	SignalPlane_Gaussian_Width := Transducer_Width/3 + 1*0                           	    // Set to 1 (meter) for no variation. Otherwise diminish amplitude at the front/back edges of the transducer for more natural / less abrpt changes.
+	SignalPlane_Gaussian_Center := vector(Transducer_Offset_X, Transducer_Offset_Y,0) 	    // center of spatial gaussian in direction of wave travel
+	Signal_k_Direction := vector(cos(Transducer_Rotation), sin(Transducer_Rotation),0) 	    // direction of signal wavevector. The "Regular" wave vector.
+	
+	// Gaussian / sinusoid profiles perpendicular to wave travel.  Oops! Bad variable names!
+	InputPlane_k := 0*2*pi/Transducer_Length                                                // Variation in phase of excitation along transducer length. This turns plane waves into something more funky.
+	InputPlane_Gaussian_Width := Transducer_Length/3 + 0*1 								// Set to 1 (meter) for no variation. Otherwise diminish amplitude at the front/back edges of the transducer for more natural / less abrpt changes.
+	InputPlane_Gaussian_Center := vector(Transducer_Offset_X, Transducer_Offset_Y,0) 		// center of spatial gaussian in direction perp. to wave travel
+	InputPlane_k_Direction := vector(-sin(Transducer_Rotation), cos(Transducer_Rotation),0) // direction parallel to transducer lines, perpendicular to wave travel.
+	
+	// Direction of field stimulus
+	Stimulus_Direction   = Signal_k_Direction 					    // Direction for transducer stimulus (magnetic)
+	Stimulus_Direction2 := Signal_k_Direction.cross(Bias_Direction) // Direction for transducer stimulus, perp., for circular field excitation
+	
+	// WRITE STIMULUS FIELD AT EACH NODE 
+	for i:=Left_Transducer ; i<=Right_Transducer ; i++ {  //Step through X nodes
+		for j:=Bottom_Transducer ; j<=Top_Transducer ; j++ { //Step through Y nodes
+			R := regions.getcell(i,j,0)
+			if R == Transducer_Region{ //|| R == Pump_Region{
+				x = (i-nx/2)*dx
+				y = (j-ny/2)*dy
+				
+				InputPlane_Distance = (vector(x,y,0)).sub(InputPlane_Gaussian_Center).dot(InputPlane_k_Direction)
+				SignalPlane_Distance = (vector(x,y,0)).sub(SignalPlane_Gaussian_Center).dot(Signal_k_Direction)
+				
+				Excitation =  Excitation_Amplitude* cos(InputPlane_k * InputPlane_Distance)  * exp(-1*pow((InputPlane_Distance)/InputPlane_Gaussian_Width,2)) * exp(-1*pow((SignalPlane_Distance)/SignalPlane_Gaussian_Width,2))
+				
+				Excitation_StandingWave_I.setVector(i,j,0, Stimulus_Direction.Mul(Excitation).Mul(sin(Signal_k*SignalPlane_Distance))) 	// Vector (B-field) excitation. I-phase
+				Excitation_StandingWave_Q.setVector(i,j,0, Stimulus_Direction.Mul(Excitation).Mul(cos(Signal_k*SignalPlane_Distance))) 	// Vector (B-field) excitation. Q-phase
+				//Excitation_StandingWave_I2.setVector(i,j,0, Stimulus_Direction2.Mul(Excitation).Mul(sin(Signal_k*SignalPlane_Distance))) 	// Vector (B-field) excitation
+				//Excitation_StandingWave_Q2.setVector(i,j,0, Stimulus_Direction2.Mul(Excitation).Mul(cos(Signal_k*SignalPlane_Distance))) 	// Vector (B-field) excitation			
+				//Excitation_ScalarField_I.setScalar(i,j,0, (Excitation/dField_dStrain)*(sin(Signal_k*SignalPlane_Distance)))            // Scalar (strain) excitation
+				//Excitation_ScalarField_Q.setScalar(i,j,0, (Excitation/dField_dStrain)*(cos(Signal_k*SignalPlane_Distance)))            // Scalar (strain) excitation
+
+			}
+		}
+	}
+	
+	// APPLY STIMULUS AS EXTERNAL FIELD
+	B_ext.add(Excitation_StandingWave_I,    sin(2*pi*Signal_Freq*t)      * exp(-1*pow((max(0,abs((t-Exc_Duration/2)-Exc_Delay)-Exc_Duration/2))/Exc_Gaussian_RiseTime,2)))// Add stimulus to external field. I-phase
+	B_ext.add(Excitation_StandingWave_Q,    sin(2*pi*Signal_Freq*t+pi/2) * exp(-1*pow((max(0,abs((t-Exc_Duration/2)-Exc_Delay)-Exc_Duration/2))/Exc_Gaussian_RiseTime,2)))// Add stimulus to external field. Q-phase
+	// 2nd component for circular excitation
+	//B_ext.add(Excitation_StandingWave_I2, -cos(2*pi*Signal_Freq*t     ) * exp(-1*pow((max(0,abs((t-Exc_Duration/2)-Exc_Delay)-Exc_Duration/2))/Exc_Gaussian_RiseTime,2)))// Add stimulus to external field. Perpendicular direction for circular field excitation. I-Phase
+	//B_ext.add(Excitation_StandingWave_Q2, -cos(2*pi*Signal_Freq*t+pi/2) * exp(-1*pow((max(0,abs((t-Exc_Duration/2)-Exc_Delay)-Exc_Duration/2))/Exc_Gaussian_RiseTime,2)))// Add stimulus to external field. Perpendicular direction for circular field excitation. Q-Phase
+		
+	// Or apply as strain
+	//Exz.add(Excitation_ScalarField_I, sin(2*pi*Signal_Freq*t) * exp(-1*pow((max(0,abs((t-Exc_Duration/2)-Exc_Delay)-Exc_Duration/2))/Exc_Gaussian_RiseTime,2)))
+	//Exz.add(Excitation_ScalarField_Q, cos(2*pi*Signal_Freq*t) * exp(-1*pow((max(0,abs((t-Exc_Duration/2)-Exc_Delay)-Exc_Duration/2))/Exc_Gaussian_RiseTime,2)))
+	
+
+		
+	//________________
+	//
+	//  WRITE PUMP
+	//_______________
+	
+	// PUMP AMPLITUDE / FREQUENCIES / WAVENUMBERS -- INPUTS HERE
+	//Pump_Amplitude := 1 *(Bias_Strength-Msat.getregion(YIG_Region)*4e-7*pi)/((Pump_Length/abs(sin(Transducer_Rotation)))*Signal_k/2/pi)        // As percent of effective field, THIS IS FOR FORWARD VOLUME WAVES!
+	Pump_k := 2*Signal_k * cos(Pump_Rotation-Transducer_Rotation) // wavenumber of pumping wave
+	
+	// Spatial Info on Pump wave. Here "Along" and "Across" correspond to the previous "SignalPlane" and "InputPlane". Oops! Bad variable names!
+	Pump_Gaussian_Width_Along := 1          //Pump_Width/4 // Width of spatial gaussian along direction of travel (parallel to wavevector)
+	Pump_Gaussian_Width_Across := 1         //Pump_Length/4  // Width of spatial gaussian across direction of travel (perpendicular to wavevector)
+	Pump_Center := vector(Pump_Offset_X, Pump_Offset_Y,0)
+	Pump_k_Direction_Along  := vector(cos(Pump_Rotation), sin(Pump_Rotation),0)  // wavevector along direction of wave travel (parallel to group velocity). The "Regular" wave vector.
+	Pump_k_Direction_Across := vector(-sin(Pump_Rotation), cos(Pump_Rotation),0)// wavevector across direction of wave travel (perpendicular to group velocity). This turns plane waves into something more funky.
+	Pump_Exc_Vec := Pump_Center.sub(SignalPlane_Gaussian_Center) // vector from pump to input transducer
+	Pump_Exc_Dist := sqrt(Pump_Exc_Vec.dot(Pump_Exc_Vec)) // vector from pump to input transducer
+	
+	// Temporal info on Pump wave
+	Pump_Gaussian_RiseTime := 1e-9 + Exc_Gaussian_RiseTime
+	Pump_Duration := Exc_Duration //+ Pump_Width/Wave_Vel_Theoretical // duration of pumping at max amplitude, excluding rise and fall times.
+	Pump_Delay := 3*Pump_Gaussian_RiseTime 
+	
+	//WRITE EACH NODE
+	for i:=Left_Pump ; i<=Right_Pump ; i++ {  //Step through X nodes
+		for j:=Bottom_Pump ; j<=Top_Pump ; j++ { //Step through Y nodes
+			//R := regions.getcell(i,j,0)
+			//if R == Pump_Region || R == Transducer_Region{ // This if statement takes a long time -- unnecessary if using rectangular pump with no rotation.
+				x = (i-nx/2)*dx
+				y = (j-ny/2)*dy
+				
+				Pump_Distance_Along := (vector(x,y,0)).sub(Pump_Center).dot(Pump_k_Direction_Along) // Find distance along wavefront
+				Pump_Distance_Across := (vector(x,y,0)).sub(Pump_Center).dot(Pump_k_Direction_Across) // Find distance across wavefront
+				
+				Excitation = Pump_Amplitude* exp(-1*pow((Pump_Distance_Across)/Pump_Gaussian_Width_Across,2)) * exp(-1*pow((Pump_Distance_Along)/Pump_Gaussian_Width_Along,2)) // Define strength of excitation
+				
+				Pump_ScalarField_I.setScalar(i,j,0, Excitation * (sin(Pump_k*Pump_Distance_Along)))			 // Scalar (strain) pump. I-phase
+				Pump_ScalarField_Q.setScalar(i,j,0, Excitation * (cos(Pump_k*Pump_Distance_Along)))			 // Scalar (strain) pump. Q-phase
+				// Pump_StandingWave_I.setVector(i,j,0, Pump_Direction.Mul(Excitation).Mul(sin(Pump_k*Pump_Distance_Along)))  // Vector (B-field) pump. I-phase
+				// Pump_StandingWave_Q.setVector(i,j,0, Pump_Direction.Mul(Excitation).Mul(cos(Pump_k*Pump_Distance_Along)))  // Vector (B-field) pump. Q-phase
+			//}
+		}
+	}
+	
+	//Pump Using Magnetic Field
+	//B_ext.add(Pump_StandingWave_I, sin(2*pi*Pump_Freq*t      )  * exp(-1*pow((max(0,abs((t-Pump_Duration/2)-Pump_Delay)-Pump_Duration/2))/Pump_Gaussian_RiseTime,2)))
+	//B_ext.add(Pump_StandingWave_Q, cos(2*pi*Pump_Freq*t		) * exp(-1*pow((max(0,abs((t-Pump_Duration/2)-Pump_Delay)-Pump_Duration/2))/Pump_Gaussian_RiseTime,2)))
+	
+	//Pump Using Strain
+	Exx.add(Pump_ScalarField_I, sin(2*pi*Pump_Freq*t+pi/2       ) * exp(-1*pow((max(0,abs((t-Pump_Duration/2)-Pump_Delay)-Pump_Duration/2))/Pump_Gaussian_RiseTime,2)))
+	Exx.add(Pump_ScalarField_Q, cos(2*pi*Pump_Freq*t+pi/2       ) * exp(-1*pow((max(0,abs((t-Pump_Duration/2)-Pump_Delay)-Pump_Duration/2))/Pump_Gaussian_RiseTime,2)))
+	
+	Ezz.add(Pump_ScalarField_I, sin(2*pi*Pump_Freq*t+pi/2 + pi  ) * exp(-1*pow((max(0,abs((t-Pump_Duration/2)-Pump_Delay)-Pump_Duration/2))/Pump_Gaussian_RiseTime,2))*dEzz_dExx)
+	Ezz.add(Pump_ScalarField_Q, cos(2*pi*Pump_Freq*t+pi/2 + pi  ) * exp(-1*pow((max(0,abs((t-Pump_Duration/2)-Pump_Delay)-Pump_Duration/2))/Pump_Gaussian_RiseTime,2))*dEzz_dExx)
+	
+	Exy.add(Pump_ScalarField_I, sin(2*pi*Pump_Freq*t+pi/2 + pi/2) * exp(-1*pow((max(0,abs((t-Pump_Duration/2)-Pump_Delay)-Pump_Duration/2))/Pump_Gaussian_RiseTime,2))*dExy_dExx)
+	Exy.add(Pump_ScalarField_Q, cos(2*pi*Pump_Freq*t+pi/2 + pi/2) * exp(-1*pow((max(0,abs((t-Pump_Duration/2)-Pump_Delay)-Pump_Duration/2))/Pump_Gaussian_RiseTime,2))*dExy_dExx)
+	
+	Exz.add(Pump_ScalarField_I, sin(2*pi*Pump_Freq*t+pi/2 + pi/2) * exp(-1*pow((max(0,abs((t-Pump_Duration/2)-Pump_Delay)-Pump_Duration/2))/Pump_Gaussian_RiseTime,2))*dExz_dExx)
+	Exz.add(Pump_ScalarField_Q, cos(2*pi*Pump_Freq*t+pi/2 + pi/2) * exp(-1*pow((max(0,abs((t-Pump_Duration/2)-Pump_Delay)-Pump_Duration/2))/Pump_Gaussian_RiseTime,2))*dExz_dExx)
+	
+	Eyz.add(Pump_ScalarField_I, sin(2*pi*Pump_Freq*t+pi/2       ) * exp(-1*pow((max(0,abs((t-Pump_Duration/2)-Pump_Delay)-Pump_Duration/2))/Pump_Gaussian_RiseTime,2))*dEyz_dExx)
+	Eyz.add(Pump_ScalarField_Q, cos(2*pi*Pump_Freq*t+pi/2       ) * exp(-1*pow((max(0,abs((t-Pump_Duration/2)-Pump_Delay)-Pump_Duration/2))/Pump_Gaussian_RiseTime,2))*dEyz_dExx)
+
+	
+//____________________________
+//
+// 5. PICK DATA TO SAVE
+//____________________________
+	minimize()
+
+	print(B_eff)
+	print(B_demag)
+
+	// Grab Measurement Region (Signal Input Transducer) Table Columns 5-7
+	Co := m.region(Signal_Input_Region)
+	TableAdd(Co)
+
+	// Grab Measurement Region (Signal Ouput Transducer) Table Columns 8-10
+	Co = m.region(Signal_Output_Region)
+	TableAdd(Co)
+
+	// Grab Measurement Point 2 (Idler Ouput Transducer) Table Columns 11-13
+	Co = m.region(Idler_Output_Region)
+	TableAdd(Co)
+
+	// OUTPUT MEASUREMENTS
+	// Grab Measurement Region (Signal Away from Transducer) Table Columns 14-16
+	Co = m.region(Signal_Away_Region1)
+	TableAdd(Co)
+
+	// Grab Measurement Region (Signal Away from Transducer) Table Columns 17-19
+	Co = m.region(Signal_Away_Region2)
+	TableAdd(Co)
+
+	// Grab Measurement Region (Signal Away from Transducer) Table Columns 20-22
+	Co = m.region(Signal_Away_Region3)
+	TableAdd(Co)
+
+	// Grab Measurement Region (Signal Away from Transducer) Table Columns 23-25
+	Co = m.region(Signal_Away_Region4)
+	TableAdd(Co)
+
+	// Grab Measurement Region (Signal Away from Transducer) Table Columns 26-28
+	Co = m.region(Signal_Away_Region5)
+	TableAdd(Co)
+
+	// Grab Measurement Region (Signal Away from Transducer) Table Columns 29-31
+	Co = m.region(Signal_Away_Region6)
+	TableAdd(Co)
+
+	// Grab Measurement Region (Signal Away from Transducer) Table Columns 32-34
+	Co = m.region(Signal_Away_Region7)
+	TableAdd(Co)
+
+	// Grab Measurement Region (Signal Away from Transducer) Table Columns 35-37
+	Co = m.region(Signal_Away_Region8)
+	TableAdd(Co)
+
+
+	//B := B_eff.region(0)// Table Columns 17-19
+	//print(B)
+	//tableadd(B)
+
+	//tableautosave(Time_Step)
+	tableautosave(1/(Signal_Freq*2*2*2))
+
+	
+	
+	
+//____________________________
+//
+// 6. RUN SIMULATION
+//____________________________
+
+//minimize()
+//relax()
+//m.loadfile("../Starters/StartFile_45degSignal_8192x8192.ovf")
+
+//saveas(b_ext, "b_ext_original")
+//saveas(m, "m_original")
+snapshotas(regions, "Regions.jpg")
+
+BigStep := 1/Signal_Freq * 30 // Run for this time between checking whether to save. 
+print(BigStep, Run_Time/BigStep)
+
+for BStep := 0 ; BStep<(Run_Time/BigStep); BStep ++{ // Take big Timesteps
+	if abs(Run_Time/BigStep/5*1 - BStep)<1{ // if one fifth of the way complete
+		Z:=1
+		//saveas(m, "m_1")
+		//saveas(b_ext, "b_ext_1")
+		//saveas(ezz, "ezz_1")
+		//saveas(exx, "exx_1")
+	}
+	if abs(Run_Time/BigStep/5*2 - BStep)<1{ // if two fifths of the way complete
+		ZZ := 1 // spacefiller
+		//saveas(m, "m_2")
+	}
+	if abs(Run_Time/BigStep/5*3 - BStep)<1{ // if three fifths of the way complete
+		ZZZ:=1
+		//saveas(m, "m_3")
+	}
+	if abs(Run_Time/BigStep/5*4 - BStep)<1{ // if four fifths of the way complete
+		ZZZZ := 1 // spacefiller
+		//saveas(m, "m_4")
+	}
+	run(BigStep)	
+	//Bias_Strength = Bias_Strength + 0.1e-3
+	//Bias_Field := Bias_Direction.Mul(Bias_Strength) 
+	//B_ext = Bias_Field // Uniform Bias Field
+	if m.comp(2).average() < 0.995{
+		BStep = 1e6
+	}
+}
+save(exx)
+//saveas(b_ext, "b_ext_final")
+saveas(m, "m_final_I")
+//run((1/Signal_Freq) / 4)
+//saveas(m, "m_final_Q")
