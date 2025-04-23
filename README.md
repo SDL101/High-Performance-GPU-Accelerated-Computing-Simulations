@@ -1,5 +1,10 @@
 # 🚀 High-Performance GPU-Accelerated Computing Simulations
 
+[![Development Status](https://img.shields.io/badge/status-under%20development-yellow)](https://github.com/SDL101/High-Performance-GPU-Accelerated-Computing-Simulations)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Last Commit](https://img.shields.io/github/last-commit/SDL101/High-Performance-GPU-Accelerated-Computing-Simulations)](https://github.com/SDL101/High-Performance-GPU-Accelerated-Computing-Simulations/commits/main)
+[![Open Issues](https://img.shields.io/github/issues/SDL101/High-Performance-GPU-Accelerated-Computing-Simulations)](https://github.com/SDL101/High-Performance-GPU-Accelerated-Computing-Simulations/issues)
+
 **Author:** Scott Lindsay  
 **Advisor:** Dr. Jander  
 **Project:** Automated Workflow Systems for Physics Simulations on HPC Clusters
